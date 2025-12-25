@@ -1,387 +1,327 @@
-#include "tokenizer.h"
-#include "stemmer.h"
-#include "util.h"
-#include <vector>
+#include "text_tokenizer.h"
+#include "word_stemmer.h"
+#include "fs_utils.h"
 
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 struct LexEntry {
-  std::string term;
-  uint64_t off; 
-  uint32_t df;
+    std::string term;
+    uint64_t offset;
+    uint32_t df;
 };
 
-static uint16_t read_u16(std::ifstream& in) { uint16_t x; in.read((char*)&x, sizeof(x)); return x; }
-static uint32_t read_u32(std::ifstream& in) { uint32_t x; in.read((char*)&x, sizeof(x)); return x; }
-static uint64_t read_u64(std::ifstream& in) { uint64_t x; in.read((char*)&x, sizeof(x)); return x; }
+static uint16_t read_u16(std::ifstream& in) { uint16_t x; in.read(reinterpret_cast<char*>(&x), sizeof(x)); return x; }
+static uint32_t read_u32(std::ifstream& in) { uint32_t x; in.read(reinterpret_cast<char*>(&x), sizeof(x)); return x; }
+static uint64_t read_u64(std::ifstream& in) { uint64_t x; in.read(reinterpret_cast<char*>(&x), sizeof(x)); return x; }
 
 static bool load_terms(const std::string& path, std::vector<LexEntry>& lex) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return false;
-  char magic[4];
-  in.read(magic, 4);
-  if (std::string(magic, 4) != "BIDX") return false;
-  uint32_t ver = read_u32(in);
-  if (ver != 1) return false;
-  uint32_t n = read_u32(in);
-  lex.clear();
-  lex.reserve(n);
-  for (uint32_t i = 0; i < n; ++i) {
-    uint16_t len = read_u16(in);
-    std::string term;
-    term.resize(len);
-    if (len) in.read(&term[0], len);
-    uint64_t off = read_u64(in);
-    uint32_t df = read_u32(in);
-    LexEntry e{term, off, df};
-    lex.push_back(e);
-  }
-  return true;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+
+    char magic[4];
+    in.read(magic, 4);
+    if (std::string(magic, 4) != "BIDX") return false;
+
+    uint32_t ver = read_u32(in);
+    if (ver != 1) return false;
+
+    uint32_t n = read_u32(in);
+    lex.clear();
+    lex.reserve(n);
+
+    for (uint32_t i = 0; i < n; ++i) {
+        uint16_t len = read_u16(in);
+        std::string term(len, '\0');
+        if (len) in.read(&term[0], len);
+        uint64_t off = read_u64(in);
+        uint32_t df = read_u32(in);
+        lex.push_back({term, off, df});
+    }
+    return true;
 }
 
-static bool load_docs(const std::string& path, std::vector<std::string>& urls, std::vector<std::string>& titles) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return false;
-  char magic[4];
-  in.read(magic, 4);
-  if (std::string(magic, 4) != "DOCS") return false;
-  uint32_t ver = read_u32(in);
-  if (ver != 1) return false;
-  uint32_t n = read_u32(in);
-  urls.resize(n);
-  titles.resize(n);
+static bool load_docs(const std::string& path,
+                      std::vector<std::string>& urls,
+                      std::vector<std::string>& titles) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
 
-  for (uint32_t i = 0; i < n; ++i) {
-    uint16_t ulen = read_u16(in);
-    std::string url; url.resize(ulen);
-    if (ulen) in.read(&url[0], ulen);
+    char magic[4];
+    in.read(magic, 4);
+    if (std::string(magic, 4) != "DOCS") return false;
 
-    uint16_t tlen = read_u16(in);
-    std::string title; title.resize(tlen);
-    if (tlen) in.read(&title[0], tlen);
+    uint32_t ver = read_u32(in);
+    if (ver != 1) return false;
 
-    urls[i] = url;
-    titles[i] = title;
-  }
-  return true;
+    uint32_t n = read_u32(in);
+    urls.resize(n);
+    titles.resize(n);
+
+    for (uint32_t i = 0; i < n; ++i) {
+        uint16_t ulen = read_u16(in);
+        std::string url(ulen, '\0');
+        if (ulen) in.read(&url[0], ulen);
+
+        uint16_t tlen = read_u16(in);
+        std::string title(tlen, '\0');
+        if (tlen) in.read(&title[0], tlen);
+
+        urls[i] = url;
+        titles[i] = title;
+    }
+    return true;
 }
 
 static int lex_find(const std::vector<LexEntry>& lex, const std::string& term) {
-  int l = 0;
-  int r = (int)lex.size() - 1;
-  while (l <= r) {
-    int m = l + (r - l) / 2;
-    if (lex[(size_t)m].term == term) return m;
-    if (lex[(size_t)m].term < term) l = m + 1;
-    else r = m - 1;
-  }
-  return -1;
+    int l = 0;
+    int r = (int)lex.size() - 1;
+    while (l <= r) {
+        int m = l + (r - l) / 2;
+        if (lex[m].term == term) return m;
+        if (lex[m].term < term) l = m + 1;
+        else r = m - 1;
+    }
+    return -1;
 }
 
-static void read_postings(std::ifstream& postings, const LexEntry& e, std::vector<uint32_t>& out) {
-  out.clear();
-  out.resize(e.df);
-  postings.seekg((std::streamoff)e.off);
-  if (e.df) postings.read((char*)&out[0], (std::streamsize)(e.df * sizeof(uint32_t)));
+static void read_postings(std::ifstream& in, const LexEntry& e, std::vector<uint32_t>& out) {
+    out.resize(e.df);
+    in.seekg((std::streamoff)e.offset);
+    if (e.df) in.read(reinterpret_cast<char*>(out.data()),
+                      e.df * sizeof(uint32_t));
 }
 
-static void intersect(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, std::vector<uint32_t>& out) {
-  out.clear();
-  size_t i = 0, j = 0;
-  while (i < a.size() && j < b.size()) {
-    if (a[i] == b[j]) { out.push_back(a[i]); i++; j++; }
-    else if (a[i] < b[j]) i++;
-    else j++;
-  }
+static void intersect(const std::vector<uint32_t>& a,
+                      const std::vector<uint32_t>& b,
+                      std::vector<uint32_t>& out) {
+    out.clear();
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] == b[j]) { out.push_back(a[i]); ++i; ++j; }
+        else if (a[i] < b[j]) ++i;
+        else ++j;
+    }
 }
 
-static void uni(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, std::vector<uint32_t>& out) {
-  out.clear();
-  size_t i = 0, j = 0;
-  while (i < a.size() && j < b.size()) {
-    if (a[i] == b[j]) { out.push_back(a[i]); i++; j++; }
-    else if (a[i] < b[j]) { out.push_back(a[i]); i++; }
-    else { out.push_back(b[j]); j++; }
-  }
-  while (i < a.size()) out.push_back(a[i++]);
-  while (j < b.size()) out.push_back(b[j++]);
+static void unite(const std::vector<uint32_t>& a,
+                  const std::vector<uint32_t>& b,
+                  std::vector<uint32_t>& out) {
+    out.clear();
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] == b[j]) { out.push_back(a[i]); ++i; ++j; }
+        else if (a[i] < b[j]) out.push_back(a[i++]);
+        else out.push_back(b[j++]);
+    }
+    while (i < a.size()) out.push_back(a[i++]);
+    while (j < b.size()) out.push_back(b[j++]);
 }
 
-static void diff(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, std::vector<uint32_t>& out) {
-  out.clear();
-  size_t i = 0, j = 0;
-  while (i < a.size()) {
-    if (j >= b.size()) { out.push_back(a[i++]); continue; }
-    if (a[i] == b[j]) { i++; j++; }
-    else if (a[i] < b[j]) { out.push_back(a[i]); i++; }
-    else { j++; }
-  }
+static void diff(const std::vector<uint32_t>& a,
+                 const std::vector<uint32_t>& b,
+                 std::vector<uint32_t>& out) {
+    out.clear();
+    size_t i = 0, j = 0;
+    while (i < a.size()) {
+        if (j >= b.size()) out.push_back(a[i++]);
+        else if (a[i] == b[j]) { ++i; ++j; }
+        else if (a[i] < b[j]) out.push_back(a[i++]);
+        else ++j;
+    }
 }
 
-static void complement_all(uint32_t doc_count, const std::vector<uint32_t>& a, std::vector<uint32_t>& out) {
-  out.clear();
-  size_t j = 0;
-  for (uint32_t d = 0; d < doc_count; ++d) {
-    while (j < a.size() && a[j] < d) j++;
-    if (j < a.size() && a[j] == d) continue;
-    out.push_back(d);
-  }
+static void complement(uint32_t doc_count,
+                       const std::vector<uint32_t>& a,
+                       std::vector<uint32_t>& out) {
+    out.clear();
+    size_t j = 0;
+    for (uint32_t d = 0; d < doc_count; ++d) {
+        while (j < a.size() && a[j] < d) ++j;
+        if (j < a.size() && a[j] == d) continue;
+        out.push_back(d);
+    }
 }
 
-enum TokType { TT_TERM, TT_AND, TT_OR, TT_NOT, TT_LP, TT_RP };
+enum TokenType { TT_TERM, TT_AND, TT_OR, TT_NOT, TT_LP, TT_RP };
 
-struct Tok {
-  TokType t;
-  std::string term;
+struct QueryToken {
+    TokenType type;
+    std::string term;
 };
 
-static bool is_op_word(const std::string& s, const char* w) {
-  if (s.size() != std::string(w).size()) return false;
-  for (size_t i = 0; i < s.size(); ++i) {
-    char c = s[i];
-    char d = w[i];
-    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-    if (d >= 'A' && d <= 'Z') d = (char)(d - 'A' + 'a');
-    if (c != d) return false;
-  }
-  return true;
+static int precedence(TokenType t) {
+    if (t == TT_NOT) return 3;
+    if (t == TT_AND) return 2;
+    if (t == TT_OR) return 1;
+    return 0;
 }
 
-static int precedence(TokType t) {
-  if (t == TT_NOT) return 3;
-  if (t == TT_AND) return 2;
-  if (t == TT_OR) return 1;
-  return 0;
-}
-
-static bool is_unary(TokType t) { return t == TT_NOT; }
+static bool is_unary(TokenType t) { return t == TT_NOT; }
 
 static void tokenize_query(const std::string& q,
-                           std::vector<Tok>& out,
+                           std::vector<QueryToken>& out,
                            const Tokenizer& tokenizer,
                            const RussianStemmer& stemmer,
-                           bool use_stemming) {
+                           bool stemming) {
     out.clear();
-    std::string cur;
-    cur.reserve(q.size());
+    std::string buf;
 
-    auto flush_word = [&]() {
-        if (cur.empty()) return;
-
+    auto flush = [&]() {
+        if (buf.empty()) return;
         std::vector<std::string> ts;
-        tokenizer.tokenize(cur, ts);
-
-
+        tokenizer.tokenize(buf, ts);
         bool first = true;
-        for (auto &raw : ts) {
-            if (raw.empty()) continue;
-
-            std::string term = raw; 
-            if (use_stemming) term = stemmer.stem(term);
-            if (term.empty()) continue;
-
-            if (!first) out.push_back({TT_AND, "AND"});
-            out.push_back({TT_TERM, term});
+        for (auto& raw : ts) {
+            std::string t = raw;
+            if (stemming) t = stemmer.stem(t);
+            if (t.empty()) continue;
+            if (!first) out.push_back({TT_AND, ""});
+            out.push_back({TT_TERM, t});
             first = false;
         }
-
-        cur.clear();
+        buf.clear();
     };
 
-    for (char ch : q) {
-        unsigned char c = (unsigned char)ch;
-
-        if (c == '(') {
-            flush_word();
-            out.push_back({TT_LP, "("});
-        } else if (c == ')') {
-            flush_word();
-            out.push_back({TT_RP, ")"});
-        } else if (c == '&') {
-            flush_word();
-            out.push_back({TT_AND, "AND"});
-        } else if (c == '|') {
-            flush_word();
-            out.push_back({TT_OR, "OR"});
-        } else if (c == '!') {
-            flush_word();
-            out.push_back({TT_NOT, "NOT"});
-        } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            flush_word();
-        } else {
-            cur.push_back((char)c);
-        }
+    for (char c : q) {
+        if (c == '(') { flush(); out.push_back({TT_LP, ""}); }
+        else if (c == ')') { flush(); out.push_back({TT_RP, ""}); }
+        else if (c == '&') { flush(); out.push_back({TT_AND, ""}); }
+        else if (c == '|') { flush(); out.push_back({TT_OR, ""}); }
+        else if (c == '!') { flush(); out.push_back({TT_NOT, ""}); }
+        else if (isspace((unsigned char)c)) flush();
+        else buf.push_back(c);
     }
-    flush_word();
+    flush();
 }
 
-static bool to_postfix(const std::vector<Tok>& in, std::vector<Tok>& out) {
-  out.clear();
-  std::vector<Tok> ops;
+static bool to_postfix(const std::vector<QueryToken>& in,
+                       std::vector<QueryToken>& out) {
+    out.clear();
+    std::vector<QueryToken> ops;
 
-  for (size_t i = 0; i < in.size(); ++i) {
-    Tok t = in[i];
-    if (t.t == TT_TERM) {
-      out.push_back(t);
-      continue;
-    }
-    if (t.t == TT_LP) { ops.push_back(t); continue; }
-    if (t.t == TT_RP) {
-      bool found = false;
-      while (!ops.empty()) {
-        Tok top = ops.back();
-        ops.pop_back();
-        if (top.t == TT_LP) { found = true; break; }
-        out.push_back(top);
-      }
-      if (!found) return false;
-      continue;
+    for (const auto& t : in) {
+        if (t.type == TT_TERM) {
+            out.push_back(t);
+        } else if (t.type == TT_LP) {
+            ops.push_back(t);
+        } else if (t.type == TT_RP) {
+            bool ok = false;
+            while (!ops.empty()) {
+                auto top = ops.back(); ops.pop_back();
+                if (top.type == TT_LP) { ok = true; break; }
+                out.push_back(top);
+            }
+            if (!ok) return false;
+        } else {
+            while (!ops.empty()) {
+                auto top = ops.back();
+                if (top.type == TT_LP) break;
+                int p1 = precedence(top.type);
+                int p2 = precedence(t.type);
+                if (p1 > p2 || (p1 == p2 && !is_unary(t.type))) {
+                    ops.pop_back();
+                    out.push_back(top);
+                } else break;
+            }
+            ops.push_back(t);
+        }
     }
 
     while (!ops.empty()) {
-      Tok top = ops.back();
-      if (top.t == TT_LP) break;
-      int p1 = precedence(top.t);
-      int p2 = precedence(t.t);
-      if (p1 > p2 || (p1 == p2 && !is_unary(t.t))) {
+        if (ops.back().type == TT_LP) return false;
+        out.push_back(ops.back());
         ops.pop_back();
-        out.push_back(top);
-      } else break;
     }
-    ops.push_back(t);
-  }
-
-  while (!ops.empty()) {
-    Tok top = ops.back();
-    ops.pop_back();
-    if (top.t == TT_LP || top.t == TT_RP) return false;
-    out.push_back(top);
-  }
-  return true;
+    return true;
 }
 
-static bool eval_postfix(
-  const std::vector<Tok>& pf,
-  uint32_t doc_count,
-  const std::vector<LexEntry>& lex,
-  std::ifstream& postings,
-  std::vector<uint32_t>& out
-) {
-  std::vector< std::vector<uint32_t> > st;
-  st.reserve(16);
+static bool eval_postfix(const std::vector<QueryToken>& pf,
+                         uint32_t doc_count,
+                         const std::vector<LexEntry>& lex,
+                         std::ifstream& postings,
+                         std::vector<uint32_t>& out) {
+    std::vector<std::vector<uint32_t>> st;
 
-  std::vector<uint32_t> tmp1, tmp2, tmp3;
-
-  for (size_t i = 0; i < pf.size(); ++i) {
-    const Tok& t = pf[i];
-    if (t.t == TT_TERM) {
-      int idx = lex_find(lex, t.term);
-      std::vector<uint32_t> v;
-      if (idx >= 0) {
-        read_postings(postings, lex[(size_t)idx], v);
-      }
-      st.push_back(v);
-      continue;
+    for (const auto& t : pf) {
+        if (t.type == TT_TERM) {
+            std::vector<uint32_t> v;
+            int idx = lex_find(lex, t.term);
+            if (idx >= 0) read_postings(postings, lex[idx], v);
+            st.push_back(v);
+        } else if (t.type == TT_NOT) {
+            if (st.empty()) return false;
+            std::vector<uint32_t> tmp;
+            complement(doc_count, st.back(), tmp);
+            st.pop_back();
+            st.push_back(tmp);
+        } else {
+            if (st.size() < 2) return false;
+            auto b = st.back(); st.pop_back();
+            auto a = st.back(); st.pop_back();
+            std::vector<uint32_t> r;
+            if (t.type == TT_AND) intersect(a, b, r);
+            else unite(a, b, r);
+            st.push_back(r);
+        }
     }
 
-    if (t.t == TT_NOT) {
-      if (st.empty()) return false;
-      tmp1 = st.back(); st.pop_back();
-      complement_all(doc_count, tmp1, tmp2);
-      st.push_back(tmp2);
-      continue;
-    }
-
-    if (t.t == TT_AND || t.t == TT_OR) {
-      if (st.size() < 2) return false;
-      tmp2 = st.back(); st.pop_back();
-      tmp1 = st.back(); st.pop_back();
-      if (t.t == TT_AND) {
-        intersect(tmp1, tmp2, tmp3);
-      } else {
-        uni(tmp1, tmp2, tmp3);
-      }
-      st.push_back(tmp3);
-      continue;
-    }
-    return false;
-  }
-
-  if (st.size() != 1) return false;
-  out = st.back();
-  return true;
+    if (st.size() != 1) return false;
+    out = st.back();
+    return true;
 }
 
 int main(int argc, char** argv) {
-  if (argc < 3) {
-    std::cerr << "Usage: bool_search_cli <index_dir> <query> [--limit N] [--stemming 0|1]\n";
-    return 1;
-  }
-  std::string index_dir = argv[1];
-  std::string query = argv[2];
+    if (argc < 3) return 1;
 
-  int limit = 20;
-  bool use_stemming = true;
-  for (int i = 3; i < argc; ++i) {
-    std::string a = argv[i];
-    if (a == "--limit" && i + 1 < argc) { limit = std::stoi(argv[i+1]); i++; }
-    else if (a == "--stemming" && i + 1 < argc) { use_stemming = (std::string(argv[i+1]) == "1"); i++; }
-  }
+    std::string index_dir = argv[1];
+    std::string query = argv[2];
 
-  std::vector<LexEntry> lex;
-  if (!load_terms(index_dir + "/terms.bin", lex)) {
-    std::cerr << "Cannot load terms.bin\n";
-    return 2;
-  }
+    int limit = 20;
+    bool stemming = true;
 
-  std::vector<std::string> urls, titles;
-  if (!load_docs(index_dir + "/docs.bin", urls, titles)) {
-    std::cerr << "Cannot load docs.bin\n";
-    return 3;
-  }
-  uint32_t doc_count = (uint32_t)urls.size();
+    for (int i = 3; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--limit" && i + 1 < argc) { limit = std::stoi(argv[++i]); }
+        else if (a == "--stemming" && i + 1 < argc) { stemming = (std::string(argv[++i]) == "1"); }
+    }
 
-  std::ifstream postings(index_dir + "/postings.bin", std::ios::binary);
-  if (!postings) {
-    std::cerr << "Cannot open postings.bin\n";
-    return 4;
-  }
+    std::vector<LexEntry> lex;
+    if (!load_terms(index_dir + "/terms.bin", lex)) return 2;
 
-  TokenizerConfig tc;
-  tc.lowercase = true;
-  tc.normalize_yo = true;
-  Tokenizer tokenizer(tc);
+    std::vector<std::string> urls, titles;
+    if (!load_docs(index_dir + "/docs.bin", urls, titles)) return 3;
+    uint32_t doc_count = (uint32_t)urls.size();
 
-  RussianStemmer stemmer;
+    std::ifstream postings(index_dir + "/postings.bin", std::ios::binary);
+    if (!postings) return 4;
 
-  std::vector<Tok> toks;
-  tokenize_query(query, toks, tokenizer, stemmer, use_stemming);
+    TokenizerConfig tc;
+    tc.lowercase = true;
+    tc.normalize_yo = true;
+    Tokenizer tokenizer(tc);
+    RussianStemmer stemmer;
 
+    std::vector<QueryToken> toks;
+    tokenize_query(query, toks, tokenizer, stemmer, stemming);
 
-  std::vector<Tok> pf;
-  if (!to_postfix(toks, pf)) {
-    std::cerr << "Parse error\n";
-    return 5;
-  }
+    std::vector<QueryToken> pf;
+    if (!to_postfix(toks, pf)) return 5;
 
-  std::vector<uint32_t> res;
-  if (!eval_postfix(pf, doc_count, lex, postings, res)) {
-    std::cerr << "Eval error\n";
-    return 6;
-  }
+    std::vector<uint32_t> res;
+    if (!eval_postfix(pf, doc_count, lex, postings, res)) return 6;
 
-  int shown = 0;
-  for (size_t i = 0; i < res.size() && shown < limit; ++i) {
-    uint32_t d = res[i];
-    if (d >= doc_count) continue;
-    std::string url = urls[d];
-    std::string title = titles[d];
-    if (title.empty()) title = url;
-    std::cout << d << "\t" << url << "\t" << title << "\n";
-    shown++;
-  }
-  return 0;
+    int shown = 0;
+    for (uint32_t d : res) {
+        if (shown >= limit) break;
+        if (d >= doc_count) continue;
+        std::string title = titles[d].empty() ? urls[d] : titles[d];
+        std::cout << d << "\t" << urls[d] << "\t" << title << "\n";
+        ++shown;
+    }
+
+    return 0;
 }
