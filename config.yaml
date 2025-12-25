@@ -1,0 +1,38 @@
+db:
+  uri: "mongodb://localhost:27017"          # строка подключения к MongoDB
+  database: "searchlab"                     # имя базы данных
+
+logic:
+  workers: 10                               # число параллельных воркеров
+  lock_seconds: 120                         # время блокировки URL “в работе”
+  seed_on_start: false                      # добавлять стартовые URL при запуске
+  seed_if_empty_only: false                 # сидить только если очередь пуста
+  delay_between_requests: [0.0, 0.02]       # пауза между HTTP запросами (диапазон)
+  revisit_interval: 604800                  # переобход URL не чаще, чем раз в N сек
+  batch_size: 10                            # сколько URL брать за одну итерацию
+  http_timeout: 20                          # таймаут одного HTTP запроса (сек)
+  idle_sleep_seconds: 3                     # сон, когда нечего качать (сек)
+  user_agent: "YV-SearchBot/1.0 (+lab crawler; contact: yv.ermakov@pupupu.me)"  # User-Agent
+
+seeding:
+  max_urls_per_source: 35000                # лимит URL на источник при сидировании
+  acl:
+    bib_gz_url: "https://aclanthology.org/anthology.bib.gz"
+    year_from: 2010                         # год от
+    year_to: 2025                           # год до
+  arxiv:
+    category: "cs.CL"                       # категория arXiv
+    page_size: 2000                         # размер страницы API
+    max_pages: 25                           # максимум страниц API
+    year_from: 2015                         # год от
+    year_to: 2025                           # год до
+
+crawl:
+  allowed_domains:                          # разрешённые домены для скачивания
+    - "aclanthology.org"
+    - "arxiv.org"
+    - "export.arxiv.org"
+
+export:
+  out_dir: "./corpus_out"                   # папка выгрузки корпуса на диск
+  max_docs: null                            # лимит выгрузки
